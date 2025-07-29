@@ -10,9 +10,12 @@ The goal is to evaluate differences in service coverage between *on-track* and *
 ## Repository Structure
 
 - 01_rawdata/ – Source Excel data from UNICEF and UN WPP
-- 03_scripts/ – Cleaning and analysis code
-- outputs/ – Final PDF/HTML reports and plots
+- Consultancy-Assessment.Rproj – Project with all the data
+- README.md – Project overview and instructions
+- run_project.R – Code to create the graphs and clean the data
+- test.HTML/ – Final HTML report
 - test.Rmd – R Markdown script for full report generation
+- user_profile.R – Code to run the requirements
 
 ## Key Insights
 

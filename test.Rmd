@@ -1,0 +1,362 @@
+---
+title: "Maternal Healthcare Coverage Analysis"
+author: ""
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: cosmo
+    highlight: tango
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+## Introduction
+This report presents a population-weighted analysis of **maternal health service coverage**, using two key indicators:
+
+- **ANC4+ (Antenatal Care Visits)**: The percentage of women aged 15–49 who received **at least four antenatal visits** during pregnancy.
+- **SBA (Skilled Birth Attendance)**: The percentage of deliveries attended by **trained health personnel** (e.g., doctors, nurses, midwives).
+
+We compare coverage levels between countries categorized as **on track** and **off track** for achieving **under-five mortality rate (U5MR)** targets. Countries with higher birth counts weigh more heavily in this analysis, ensuring that global estimates reflect where the greatest need and service impact occur.
+
+
+## Data
+Data Sources
+We utilize three primary data sources:
+
+1. UN World Population Estimates from 1950 to 2021 and Projections from 2022 to 2100: Provides demographic total population births.
+
+2. UNICEF Global Dataflow: Contains maternal health indicators of ANC4 and SBA
+
+3. U5MR Status Classification: Identifies countries on/off track for child mortality targets
+
+## Data Cleaning Process
+
+```{r}
+# Load required packages
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(stringr)
+library(rnaturalearth)
+library(sf)
+library(ggrepel)
+#library(kableExtra)
+
+# Function to read and clean Excel sheets
+read_data <- function(file_path) {
+  sheets <- c("Estimates", "Projections")
+  result <- lapply(sheets, function(sheet) {
+    read_excel(file_path, sheet = sheet) %>%
+      filter(!is.na(...1)) %>%
+      { colnames(.) <- as.character(.[1, ])
+      .[-1, ]}
+  })
+  names(result) <- sheets
+  return(result)
+}
+
+# Read and clean demographic data
+data <- read_data("01_rawdata/WPP2022_GEN_F01_DEMOGRAPHIC_INDICATORS_COMPACT_REV1.xlsx")
+estimates <- data$Estimates
+projections <- data$Projections
+
+# Clean health indicator data
+DATAFLOW <- read_excel("01_rawdata/GLOBAL_DATAFLOW_2018-2022.xlsx") %>% 
+  filter(!is.na(`2022`)) %>% 
+  select(-...3) %>% 
+  rename(ANC_SBA = ...2) %>% 
+  pivot_longer(cols = `2018`:`2022`, names_to = "Year", values_to = "Percentage") %>% 
+  mutate(
+    Percentage = ifelse(grepl("^[0-9.]+$", Percentage), Percentage, NA),
+    Percentage = as.numeric(Percentage),
+    ANC_SBA = case_when(
+      str_detect(ANC_SBA, "Skilled birth attendant") ~ "SBA",
+      str_detect(ANC_SBA, "Antenatal care") ~ "ANC4",
+      TRUE ~ "OTHER")
+  ) %>% 
+  rename(OfficialName = `Time period`) %>% 
+  pivot_wider(names_from = ANC_SBA, values_from = Percentage)
+
+# Clean U5MR classification data
+classification <- read_excel("01_rawdata/On-track and off-track countries.xlsx") %>% 
+  mutate(Status.U5MR = ifelse(Status.U5MR == "Acceleration Needed", "Off-track", "On-track")) %>% 
+  left_join(DATAFLOW, by = "OfficialName") %>% 
+  filter(!is.na(Year)) %>% 
+  mutate(across(c(ANC4, SBA), ~ as.character(map_chr(., ~ if(length(.) == 0) NA_character_ else as.character(.))))) %>% 
+  mutate(across(c(ANC4, SBA), ~ na_if(., "NULL"))) %>% 
+  mutate(across(c(ANC4, SBA), as.numeric)) %>% 
+  filter(Year >= 2018 & Year <= 2022) %>%
+  group_by(ISO3Code, OfficialName, Status.U5MR) %>%
+  arrange(desc(Year)) %>%
+  summarise(
+    ANC4 = first(ANC4[!is.na(ANC4)]),
+    SBA = first(SBA[!is.na(SBA)]),
+    .groups = "drop"
+  )
+
+# Merge all datasets
+unicef <- bind_rows(
+  estimates %>% mutate(source = "estimates"),
+  projections %>% mutate(source = "projections")) %>%
+  left_join(classification %>% rename(`ISO3 Alpha-code` = ISO3Code)) %>%
+  filter(
+    Year %in% 2018:2022,
+    !is.na(`ISO3 Alpha-code`),
+    !is.na(OfficialName)
+  ) %>%
+  group_by(Status.U5MR) %>%
+  mutate(    across( `Births (thousands)`,
+      ~ replace_na(as.numeric(str_remove_all(., ",")), 0)  ) ) %>%
+  ungroup() %>%
+  select(`ISO3 Alpha-code`,OfficialName,Year,Status.U5MR,
+         `Births (thousands)`,SBA,ANC4,`Region, subregion, country or area *`, `Parent code`) %>%
+    mutate(TB_ANC4 = `Births (thousands)` * ANC4/100,
+         TB_SBA = `Births (thousands)` * SBA/100,
+         `Births (thousands) ANC4` = ifelse(is.na(ANC4),0,`Births (thousands)`),
+         `Births (thousands) SBA` = ifelse(is.na(SBA),0,`Births (thousands)`)) 
+```
+We performed the following data cleaning steps:
+
+1. **Reading Excel Sheets**: Cleaned and harmonized sheets from the World Population Prospects (WPP) file by removing header rows and reassigning column names.
+2. **Transforming Indicator Data**: The raw ANC4+ and SBA indicators were reshaped for consistency. Also, we filtered only valid numeric values to clear labels.
+3. **Matching Country Classifications**: Merged maternal health data with U5MR status classification based for each country, by clasifying the countries into just `On-track` and `Off-track`.
+4. **Filtering Years and Selecting Most Recent Values**: Filtered to keep only coverage values from 2018 to 2022, and selecting the **most recent valid entry** of ANC4 and SBA  per country.
+
+
+## Methodology
+
+
+To calculate the **population-weighted coverage**, we apply the following formula:
+
+\[ \text{Weighted Average} = \frac{\sum (\text{Coverage}_i \times \text{Births}_i)}{\sum \text{Births}_i} \]
+
+This is applied separately for:
+- **ANC4+** (4+ antenatal visits)
+- **SBA** (Skilled Birth Attendance)
+
+The goal is to estimate the global averages that account for the distribution of births, giving more weight to countries with higher fertility and birth counts.
+
+```{r}
+# Load world map data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Define color palette
+offtrack_color <- "#D73027"
+ontrack_color <- "#1A9850"
+ontrack_label_color <- "#009B95"
+
+# Prepare mapping data
+unicef_recent <- unicef %>%
+  group_by(`ISO3 Alpha-code`) %>%
+  filter(Year == max(Year)) %>%
+  ungroup()
+
+mapdata_filtered <- world %>%
+  left_join(unicef_recent, by = c("iso_a3" = "ISO3 Alpha-code")) %>%
+  mutate(
+    label_color = ifelse(Status.U5MR == "On-track", "OnLabel", "OffLabel")
+  )
+```
+
+## Results
+
+The table below presents the **weighted average coverage** for each group of countries:
+
+```{r}
+percentages <- unicef %>% 
+  filter(Year == 2022) %>%
+  group_by(Status.U5MR) %>% 
+  summarise(
+    ANC4_Coverage = 100 * sum(TB_ANC4, na.rm = TRUE)/sum(`Births (thousands) ANC4`, na.rm = TRUE),
+    SBA_Coverage = 100 * sum(SBA, na.rm = TRUE)/sum(`Births (thousands) SBA`, na.rm = TRUE)
+  )
+
+knitr::kable(percentages %>%
+  rename(
+    "U5MR Status" = Status.U5MR,
+    "ANC4+ Coverage (%)" = ANC4_Coverage,
+    "Skilled Birth Attendance (%)" = SBA_Coverage
+  ), digits = 1)
+```
+
+- **On-track countries** have higher average coverage in both ANC4+ and SBA indicators. This suggests greater access to maternal health services where progress toward U5MR targets is being achieved.
+- **Off-track countries** report lower average coverage, particularly for SBA, indicating reduced access to prenatal services and possibly systemic gaps in early maternal care.
+- The coverage gap between the groups—especially pronounced in ANC4+—highlights disparities in maternal care infrastructure and service delivery.
+
+
+## ANC4+ Coverage Map
+
+This map illustrates where antenatal care coverage is high or low and how it aligns with U5MR status. Countries in grey have no available information or recent ANC4+ data.
+
+```{r}
+ggplot() +
+  geom_sf(data = filter(mapdata_filtered, is.na(TB_ANC4)),
+          fill = "gray80", color = "white", size = 0.2) +
+  geom_sf(data = filter(mapdata_filtered, !is.na(TB_ANC4)),
+          aes(fill = TB_ANC4), color = "white", size = 0.2) +
+  geom_sf(data = filter(mapdata_filtered, !is.na(TB_ANC4)),
+          aes(color = Status.U5MR), fill = NA, size = 0.4) +
+  geom_text_repel(data = filter(mapdata_filtered, !is.na(TB_ANC4)),
+                  aes(geometry = geometry, label = iso_a3, color = label_color),
+                  stat = "sf_coordinates",
+                  size = 3, fontface = "bold",
+                  box.padding = 0.3, max.overlaps = Inf,
+                  segment.color = "gray50", bg.color = "white", bg.r = 0.15,
+                  seed = 42, show.legend = FALSE) +
+  scale_fill_gradient(low = "#f7fcf5", high = "#00441b", 
+                      name = "Total Births (thousands)", 
+                      na.value = "gray80") +
+  scale_color_manual(
+    name = "U5MR Status",
+    values = c("Off-track" = offtrack_color, "On-track" = ontrack_color,
+               "OnLabel" = ontrack_label_color, "OffLabel" = offtrack_color),
+    labels = c("Off-track" = "Not on track", "On-track" = "On track",
+               "OnLabel" = "", "OffLabel" = ""),
+    guide = guide_legend(override.aes = list(fill = NA))
+  ) +
+  labs(title = "Coverage of Antenatal Care (4+ Visits) Among Women Aged 15-49 in 2022",
+       caption = "Source: UNICEF Data") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.position = "right",
+        axis.text = element_blank(),
+        panel.grid = element_blank())
+```
+
+- Higher ANC4+ coverage is mostly clustered in countries categorized as on-track, especially in regions like Latin America and parts of Asia.
+- Many countries in Africa show low ANC4+ coverage and are predominantly off-track.
+- The presence of large gaps in data availability in several low-income countries further highlights areas requiring data system strengthening.
+
+## Skilled Birth Attendance
+
+```{r}
+ggplot() +
+  geom_sf(data = filter(mapdata_filtered, is.na(TB_SBA)),
+          fill = "gray80", color = "white", size = 0.2) +
+  geom_sf(data = filter(mapdata_filtered, !is.na(TB_SBA)),
+          aes(fill = TB_SBA), color = "white", size = 0.2) +
+  geom_sf(data = filter(mapdata_filtered, !is.na(TB_SBA)),
+          aes(color = Status.U5MR), fill = NA, size = 0.4) +
+  geom_text_repel(data = filter(mapdata_filtered, !is.na(TB_SBA)),
+                  aes(geometry = geometry, label = iso_a3, color = label_color),
+                  stat = "sf_coordinates",
+                  size = 3, fontface = "bold",
+                  box.padding = 0.3, max.overlaps = Inf,
+                  segment.color = "gray50", bg.color = "white", bg.r = 0.15,
+                  seed = 42, show.legend = FALSE) +
+  scale_fill_gradient(low = "#f7fcf5", high = "#00441b", 
+                      name = "Total Births (thousands)", 
+                      na.value = "gray80") +
+  scale_color_manual(
+    name = "U5MR Status",
+    values = c("Off-track" = offtrack_color, "On-track" = ontrack_color,
+               "OnLabel" = ontrack_label_color, "OffLabel" = offtrack_color),
+    labels = c("Off-track" = "Not on track", "On-track" = "On track",
+               "OnLabel" = "", "OffLabel" = ""),
+    guide = guide_legend(override.aes = list(fill = NA))
+  ) +
+  labs(title = "Coverage of Deliveries Attended by Skilled Health Personnel in 2022",
+       caption = "Source: UNICEF Data") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.position = "right",
+        axis.text = element_blank(),
+        panel.grid = element_blank())
+```
+
+- SBA coverage is generally higher and more consistent across both groups compared to ANC4+.
+- Nevertheless, several off-track countries—particularly in Central Africa—remain significantly behind in ensuring deliveries are attended by skilled professionals.
+- The map shows a narrower global disparity in SBA than ANC4+, but the shortfall in off-track countries is bigger.
+
+
+## Skilled Birth Attendance Anual Variations
+
+```{r}
+unicefVariation = unicef %>% 
+  left_join(estimates %>%
+              filter(Type == "Subregion") %>%
+              distinct(`Region, subregion, country or area *`, `Location code`, `Parent code`) %>%
+              rename(Subregion = `Region, subregion, country or area *`) %>%
+              left_join(estimates %>%
+                          filter(Type == "Region") %>%
+                          distinct(`Region, subregion, country or area *`, `Location code`) %>%
+                          rename(Region = `Region, subregion, country or area *`,
+                                 `Parent code` = `Location code`)) %>%
+              select(-`Parent code`) %>%
+              rename(`Parent code` = `Location code`)) %>% 
+  group_by(Year, Region, Status.U5MR) %>%
+  summarise(Total = sum(TB_SBA)) %>%
+  group_by(Region, Status.U5MR) %>%
+  mutate(Total_diff = Total - lag(Total),
+         Total_pct_change = (Total - lag(Total)) / lag(Total) * 100,
+         Region = ifelse(is.na(Region), "NORTHERN AMERICA", Region)) %>%
+  filter(!is.na(Total_pct_change))
+
+
+#------------------------
+# Plot 2: Time series of % population change
+#------------------------
+ggplot(unicefVariation, aes(x = as.integer(Year), y = Total_pct_change, color = Region, group = Region)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  geom_text_repel(aes(label = paste0(round(Total_pct_change, 1), "%")),
+                  size = 4,
+                  fontface = "bold",
+                  max.overlaps = 50,
+                  show.legend = FALSE) +
+  facet_wrap(~ Status.U5MR, scales = "fixed", labeller = as_labeller(c(
+    "On-track" = "On-track",
+    "Off-track" = "Off-track"))) +
+  labs(
+    title = "Anual % Change in Coverage of Deliveries Attended by Skilled Health Personnel",
+    x = "Year",
+    y = "% Change",
+    color = "Region",
+    caption = "Source: UNICEF Population Data, 2018–2022") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size = 13),
+        strip.text = element_text(size = 14, face = "bold"),
+        legend.title = element_text(face = "bold"))
+
+```
+
+- Northern America experienced the strongest bounce: after a –1.2% drop in 2019, it surged to +1.4% in 2021, followed by a slight dip to +0.2% in 2022.
+
+- Africa and Oceania had positive trends, though Africa declined again to –1.2% by 2022.
+
+- Europe and Latin America improved modestly, reaching –1.1% to –0.9% change in 2022.
+
+- Asia (not shown explicitly) may be reflected within Oceania or other regions if grouped.
+
+## Conclusions
+
+This analysis reveals contrasts in maternal health service access across U5MR performance groups. Key takeaways include:
+
+- Countries **on track to meet U5MR goals** have significantly higher population-weighted coverage for both ANC4+ and SBA indicators.
+- Countries **off track** display lower coverage and represent a major gap in global maternal healthcare delivery.
+- Using **population-weighted metrics** helps better reflect needs and disparities than simple averages.
+- **ANC4+ coverage** is particularly lower in off-track countries, suggesting a more urgent need to improve prenatal service access compared to SBA.
+- **Recent trends in SBA coverage (2019–2022)** reveal that **on-track countries** show more **resilience and recovery capacity**, with several regions improving coverage after initial declines, while **off-track countries** exhibit **flat or negative growth**, indicating deeper systemic barriers.
+
+
